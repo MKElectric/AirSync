@@ -1,4 +1,3 @@
-import time
 import threading
 from typing import Optional, Callable
 
@@ -37,13 +36,13 @@ class AudioEngine:
 
         self._scheduler = PlaybackScheduler(
             buffer=self._buffer,
+            timestamp_gen=self._timestamp_gen,
             sample_rate=sample_rate,
             channels=channels,
             sample_width=sample_width,
         )
 
-        self._running = False
-        self._callback: Optional[Callable[[AudioChunk], None]] = None
+        self._running = threading.Event()
 
     @property
     def buffer(self) -> RingBuffer:
@@ -55,33 +54,38 @@ class AudioEngine:
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return self._running.is_set()
 
     def set_playback_callback(self, callback: Callable[[bytes, float], None]):
         self._scheduler.set_callback(callback)
+
+    def set_underrun_callback(self, callback: Callable[[], None]):
+        self._scheduler.set_underrun_callback(callback)
 
     def set_delay_offset(self, offset_seconds: float):
         self._scheduler.set_pts_offset(offset_seconds)
 
     def receive_pcm(self, data: bytes) -> AudioChunk:
         """Receive a PCM audio chunk, timestamp it, and write to buffer."""
-        chunk = self._timestamp_gen.timestamp(data)
+        bytes_per_frame = self.channels * self.sample_width
+        frame_count = len(data) // bytes_per_frame
+        chunk = self._timestamp_gen.timestamp(frame_count)
         self._buffer.write(data)
         return chunk
 
     def start(self):
-        if self._running:
+        if self._running.is_set():
             return
         self._timestamp_gen.initialize()
         self._scheduler.start()
-        self._running = True
+        self._running.set()
 
     def stop(self):
-        if not self._running:
+        if not self._running.is_set():
             return
         self._scheduler.stop()
         self._timestamp_gen.reset()
-        self._running = False
+        self._running.clear()
 
     def reset(self):
         self.stop()

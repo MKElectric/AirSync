@@ -1,5 +1,4 @@
 import threading
-import array
 from typing import Optional
 
 
@@ -61,30 +60,29 @@ class RingBuffer:
 
         return offset
 
-    def read(self, size: int, block: bool = True) -> Optional[bytes]:
-        """Read data from the buffer. Returns bytes or None if empty and non-blocking."""
+    def read(self, size: int, block: bool = True, timeout: Optional[float] = None) -> Optional[bytes]:
+        """Read up to `size` bytes. Returns None if empty and non-blocking/timed out."""
         with self._not_empty:
-            while self._filled == 0:
-                if not block:
-                    return None
-                self._not_empty.wait()
+            if not self._wait_for_data(block, timeout):
+                return None
 
             to_read = min(size, self._filled)
-            result = bytearray(to_read)
-            pos = self._read_pos % self._capacity
-
-            if pos + to_read <= self._capacity:
-                result[:] = self._buffer[pos:pos + to_read]
-            else:
-                split = self._capacity - pos
-                result[:split] = self._buffer[pos:]
-                result[split:] = self._buffer[:to_read - split]
-
-            self._read_pos = (self._read_pos + to_read) % self._capacity
-            self._filled -= to_read
+            result = self._read_bytes(to_read)
             self._not_full.notify()
+            return result
 
-        return bytes(result)
+    def read_exact(self, size: int, block: bool = True, timeout: Optional[float] = None) -> Optional[bytes]:
+        """Read exactly `size` bytes. Returns None if insufficient data."""
+        with self._not_empty:
+            if not self._wait_for_data(block, timeout):
+                return None
+
+            if self._filled < size:
+                return None
+
+            result = self._read_bytes(size)
+            self._not_full.notify()
+            return result
 
     def peek(self, size: int, offset: int = 0) -> Optional[bytes]:
         """Peek at data without advancing read pointer."""
@@ -105,8 +103,38 @@ class RingBuffer:
             return bytes(result)
 
     def clear(self):
+        """Clear the buffer and wake all waiting threads."""
         with self._lock:
             self._write_pos = 0
             self._read_pos = 0
             self._filled = 0
-            self._not_full.notify()
+            self._not_full.notify_all()
+            self._not_empty.notify_all()
+
+    def _wait_for_data(self, block: bool, timeout: Optional[float]) -> bool:
+        """Wait until data is available. Returns False if timed out or non-blocking with no data."""
+        while self._filled == 0:
+            if not block:
+                return False
+            if timeout is not None:
+                if not self._not_empty.wait(timeout=timeout):
+                    return False
+            else:
+                self._not_empty.wait()
+        return True
+
+    def _read_bytes(self, size: int) -> bytes:
+        """Read `size` bytes from the buffer. Caller must hold the lock."""
+        result = bytearray(size)
+        pos = self._read_pos % self._capacity
+
+        if pos + size <= self._capacity:
+            result[:] = self._buffer[pos:pos + size]
+        else:
+            split = self._capacity - pos
+            result[:split] = self._buffer[pos:]
+            result[split:] = self._buffer[:size - split]
+
+        self._read_pos = (self._read_pos + size) % self._capacity
+        self._filled -= size
+        return bytes(result)

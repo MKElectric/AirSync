@@ -1,73 +1,75 @@
 import time
+import threading
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class AudioChunk:
-    """A timestamped chunk of PCM audio data."""
-    data: bytes
+    """Metadata for a timestamped PCM audio segment."""
     pts: float
     sequence: int
     sample_rate: int
     channels: int
     sample_width: int
+    frames: int
 
     @property
     def duration(self) -> float:
         """Duration of this chunk in seconds."""
-        bytes_per_sample = self.channels * self.sample_width
-        total_samples = len(self.data) / bytes_per_sample
-        return total_samples / self.sample_rate
-
-    @property
-    def frames(self) -> int:
-        """Number of audio frames in this chunk."""
-        bytes_per_frame = self.channels * self.sample_width
-        return len(self.data) // bytes_per_frame
+        return self.frames / self.sample_rate
 
 
 class TimestampGenerator:
-    """Generates monotonically increasing presentation timestamps."""
+    """Generates monotonically increasing presentation timestamps from a single clock source."""
 
     def __init__(self, sample_rate: int = 48000, channels: int = 2, sample_width: int = 2):
         self.sample_rate = sample_rate
         self.channels = channels
         self.sample_width = sample_width
+        self._lock = threading.Lock()
         self._sequence = 0
+        self._total_samples = 0
         self._base_pts: float = 0.0
-        self._accumulated_duration: float = 0.0
         self._initialized = False
 
     def initialize(self):
         """Set the base PTS to current wall clock time."""
-        self._base_pts = time.monotonic()
-        self._accumulated_duration = 0.0
-        self._sequence = 0
-        self._initialized = True
+        with self._lock:
+            self._base_pts = time.monotonic()
+            self._total_samples = 0
+            self._sequence = 0
+            self._initialized = True
 
     @property
     def current_pts(self) -> float:
-        if not self._initialized:
-            raise RuntimeError("TimestampGenerator not initialized")
-        return self._base_pts + self._accumulated_duration
+        """Current presentation timestamp computed from base + integer sample count."""
+        with self._lock:
+            if not self._initialized:
+                raise RuntimeError("TimestampGenerator not initialized")
+            return self._base_pts + self._total_samples / self.sample_rate
 
-    def timestamp(self, data: bytes) -> AudioChunk:
-        """Create a timestamped audio chunk."""
-        if not self._initialized:
-            self.initialize()
+    def timestamp(self, frame_count: int) -> AudioChunk:
+        """Create a timestamped audio chunk from frame count (no data copy)."""
+        with self._lock:
+            if not self._initialized:
+                self._base_pts = time.monotonic()
+                self._total_samples = 0
+                self._sequence = 0
+                self._initialized = True
 
-        pts = self.current_pts
-        chunk = AudioChunk(
-            data=data,
-            pts=pts,
-            sequence=self._sequence,
-            sample_rate=self.sample_rate,
-            channels=self.channels,
-            sample_width=self.sample_width,
-        )
-        self._sequence += 1
-        self._accumulated_duration += chunk.duration
-        return chunk
+            pts = self._base_pts + self._total_samples / self.sample_rate
+            chunk = AudioChunk(
+                pts=pts,
+                sequence=self._sequence,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                sample_width=self.sample_width,
+                frames=frame_count,
+            )
+            self._sequence += 1
+            self._total_samples += frame_count
+            return chunk
 
     def reset(self):
-        self._initialized = False
+        with self._lock:
+            self._initialized = False
