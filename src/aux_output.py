@@ -55,6 +55,7 @@ class PipeWireSink(AudioSink):
         self._node_name = node_name
         self._process: Optional[subprocess.Popen] = None
         self._healthy = False
+        self._lock = threading.Lock()
 
     def start(self, sample_rate: int, channels: int, sample_width: int):
         args = [
@@ -67,45 +68,49 @@ class PipeWireSink(AudioSink):
         if self._device:
             args.extend(["--target", self._device])
 
-        self._process = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self._healthy = True
+        with self._lock:
+            self._process = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._healthy = True
 
     def write(self, data: bytes) -> bool:
-        if not self._process or not self._healthy:
-            return False
-        try:
-            self._process.stdin.write(data)
-            self._process.stdin.flush()
-            return True
-        except (BrokenPipeError, OSError):
-            self._healthy = False
-            return False
+        with self._lock:
+            if not self._process or not self._healthy:
+                return False
+            try:
+                self._process.stdin.write(data)
+                self._process.stdin.flush()
+                return True
+            except (BrokenPipeError, OSError):
+                self._healthy = False
+                return False
 
     def stop(self):
-        if self._process:
-            try:
-                self._process.stdin.close()
-            except Exception:
-                pass
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            self._process = None
-        self._healthy = False
+        with self._lock:
+            if self._process:
+                try:
+                    self._process.stdin.close()
+                except Exception:
+                    pass
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                self._process = None
+            self._healthy = False
 
     def is_healthy(self) -> bool:
-        if not self._process:
-            return False
-        if self._process.poll() is not None:
-            self._healthy = False
-        return self._healthy
+        with self._lock:
+            if not self._process:
+                return False
+            if self._process.poll() is not None:
+                self._healthy = False
+            return self._healthy
 
 
 class AuxOutputAdapter:
@@ -113,6 +118,9 @@ class AuxOutputAdapter:
 
     Receives scheduled (pcm_data, pts) tuples from PlaybackScheduler,
     holds them in a delay line to match WiFi latency, then outputs to an AudioSink.
+
+    Playback is paced by PTS: each frame is played at its scheduled time,
+    not as fast as possible. This ensures synchronization with the master clock.
     """
 
     def __init__(
@@ -132,6 +140,7 @@ class AuxOutputAdapter:
         self.frame_size = frame_size
 
         self._bytes_per_frame = channels * sample_width * frame_size
+        self._frame_duration = frame_size / sample_rate
         self._target_frames = int(target_latency_ms / 1000.0 * sample_rate / frame_size)
 
         self._delay_buffer: deque = deque()
@@ -143,18 +152,21 @@ class AuxOutputAdapter:
         self._frame_count = 0
         self._underrun_callback: Optional[Callable[[], None]] = None
         self._status_callback: Optional[Callable[[dict], None]] = None
+        self._last_status_time = 0.0
+        self._status_interval = 1.0
 
     def set_underrun_callback(self, callback: Callable[[], None]):
         self._underrun_callback = callback
 
     def set_status_callback(self, callback: Callable[[dict], None]):
-        """Called periodically with adapter status."""
+        """Called periodically with adapter status (rate-limited to ~1Hz)."""
         self._status_callback = callback
 
     def set_latency(self, latency_ms: float):
         """Reconfigure target latency."""
-        self.target_latency_ms = latency_ms
-        self._target_frames = int(latency_ms / 1000.0 * self.sample_rate / self.frame_size)
+        with self._lock:
+            self.target_latency_ms = latency_ms
+            self._target_frames = int(latency_ms / 1000.0 * self.sample_rate / self.frame_size)
 
     def on_scheduled_frame(self, data: bytes, pts: float):
         """Callback from PlaybackScheduler. Queues frame for delayed playback."""
@@ -169,6 +181,7 @@ class AuxOutputAdapter:
         self._running.set()
         self._underrun_count = 0
         self._frame_count = 0
+        self._last_status_time = 0.0
         self._thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._thread.start()
 
@@ -180,7 +193,7 @@ class AuxOutputAdapter:
         self.sink.stop()
 
     def _playback_loop(self):
-        """Main loop: drains delay buffer, detects underruns, outputs to sink."""
+        """Main loop: drains delay buffer, paces playback by PTS, outputs to sink."""
         silence = bytes(self._bytes_per_frame)
 
         while self._running.is_set():
@@ -190,10 +203,18 @@ class AuxOutputAdapter:
                 self._handle_underrun()
                 self.sink.write(silence)
                 self._emit_status()
+                time.sleep(self._frame_duration / 4)
                 continue
 
             data, pts = frame
             self._frame_count += 1
+
+            target_time = pts
+            now = time.monotonic()
+            sleep_time = target_time - now
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
             if not self.sink.write(data):
                 self._handle_underrun()
@@ -201,32 +222,40 @@ class AuxOutputAdapter:
             self._emit_status()
 
     def _next_frame(self) -> Optional[tuple]:
-        """Get the next frame ready for playback, or None if buffer is empty."""
+        """Get the next frame ready for playback, or None if buffer is below target."""
         with self._lock:
             if not self._delay_buffer:
                 return None
 
-            data, pts = self._delay_buffer[0]
-
             if len(self._delay_buffer) < self._target_frames:
                 return None
 
-            self._delay_buffer.popleft()
+            data, pts = self._delay_buffer.popleft()
             return data, pts
 
     def _handle_underrun(self):
         """Handle an underrun condition."""
-        self._underrun_count += 1
-        if self._underrun_callback:
-            self._underrun_callback()
+        with self._lock:
+            self._underrun_count += 1
+            cb = self._underrun_callback
+        if cb:
+            cb()
 
     def _emit_status(self):
-        """Emit status update if callback is set."""
+        """Emit status update if callback is set, rate-limited to ~1Hz."""
         if not self._status_callback:
             return
 
+        now = time.monotonic()
+        if now - self._last_status_time < self._status_interval:
+            return
+
+        self._last_status_time = now
+
         with self._lock:
             buffer_fill = len(self._delay_buffer)
+            underruns = self._underrun_count
+            frames = self._frame_count
 
         fill_ms = buffer_fill * self.frame_size / self.sample_rate * 1000
 
@@ -234,8 +263,8 @@ class AuxOutputAdapter:
             "buffer_fill_frames": buffer_fill,
             "buffer_fill_ms": fill_ms,
             "target_latency_ms": self.target_latency_ms,
-            "underrun_count": self._underrun_count,
-            "frames_played": self._frame_count,
+            "underrun_count": underruns,
+            "frames_played": frames,
             "sink_healthy": self.sink.is_healthy(),
         })
 
@@ -251,8 +280,10 @@ class AuxOutputAdapter:
 
     @property
     def underrun_count(self) -> int:
-        return self._underrun_count
+        with self._lock:
+            return self._underrun_count
 
     @property
     def frames_played(self) -> int:
-        return self._frame_count
+        with self._lock:
+            return self._frame_count

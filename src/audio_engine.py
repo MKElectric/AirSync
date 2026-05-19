@@ -20,6 +20,7 @@ class AudioEngine:
         channels: int = DEFAULT_CHANNELS,
         sample_width: int = DEFAULT_SAMPLE_WIDTH,
         buffer_seconds: float = DEFAULT_BUFFER_SECONDS,
+        min_fill_frames: int = 9600,
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -40,6 +41,7 @@ class AudioEngine:
             sample_rate=sample_rate,
             channels=channels,
             sample_width=sample_width,
+            min_fill_frames=min_fill_frames,
         )
 
         self._running = threading.Event()
@@ -70,7 +72,7 @@ class AudioEngine:
         bytes_per_frame = self.channels * self.sample_width
         frame_count = len(data) // bytes_per_frame
         chunk = self._timestamp_gen.timestamp(frame_count)
-        self._buffer.write(data)
+        self._buffer.write(data, pts=chunk.pts)
         return chunk
 
     def start(self):

@@ -6,7 +6,12 @@ from src.timestamp import TimestampGenerator
 
 
 class PlaybackScheduler:
-    """Schedules audio playback based on presentation timestamps from a shared clock."""
+    """Schedules audio playback based on presentation timestamps from a shared clock.
+
+    Reads (data, pts) pairs from the ring buffer, waits until the PTS time arrives,
+    then dispatches to the callback. This ensures frames are played at their
+    intended presentation time, not as fast as possible.
+    """
 
     def __init__(
         self,
@@ -34,6 +39,7 @@ class PlaybackScheduler:
         self._last_pts: float = 0.0
         self._underrun_callback: Optional[Callable[[], None]] = None
         self._was_underrun = False
+        self._started = False
 
     @property
     def is_running(self) -> bool:
@@ -60,6 +66,7 @@ class PlaybackScheduler:
             return
         self._running.set()
         self._was_underrun = False
+        self._started = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -71,13 +78,13 @@ class PlaybackScheduler:
             self._thread = None
 
     def _run(self):
-        """Main scheduling loop: reads frames, waits for PTS, dispatches to callback."""
+        """Main scheduling loop: reads frames with PTS, waits for presentation time, dispatches."""
         bytes_per_frame = self.channels * self.sample_width
         frame_bytes = self.frame_size * bytes_per_frame
         min_fill_bytes = self.min_fill_frames * bytes_per_frame
 
         while self._running.is_set():
-            data = self._buffer.read_exact(frame_bytes, block=True, timeout=0.1)
+            data, pts = self._buffer.read_with_pts(frame_bytes, block=True, timeout=0.1)
             if data is None:
                 if self._running.is_set() and not self._was_underrun:
                     self._was_underrun = True
@@ -89,16 +96,28 @@ class PlaybackScheduler:
 
             self._was_underrun = False
 
+            if not self._started:
+                if self._buffer.filled < min_fill_bytes:
+                    continue
+                self._started = True
+
             with self._lock:
                 callback = self._callback
                 pts_offset = self._pts_offset
 
-            pts = self._timestamp_gen.current_pts + pts_offset
+            target_time = pts + pts_offset
+            now = time.monotonic()
+            sleep_time = target_time - now
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+            actual_pts = time.monotonic()
 
             if callback and len(data) > 0:
-                callback(data, pts)
+                callback(data, actual_pts)
 
-            self._last_pts = pts
+            self._last_pts = actual_pts
 
     @property
     def buffer_fill_ms(self) -> float:

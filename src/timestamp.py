@@ -20,7 +20,13 @@ class AudioChunk:
 
 
 class TimestampGenerator:
-    """Generates monotonically increasing presentation timestamps from a single clock source."""
+    """Generates monotonically increasing presentation timestamps from a single clock source.
+
+    PTS is computed as base_pts + total_samples / sample_rate using integer sample counting
+    to avoid floating-point accumulation drift.
+
+    Supports clock reconciliation to correct for DAC rate deviation from nominal sample rate.
+    """
 
     def __init__(self, sample_rate: int = 48000, channels: int = 2, sample_width: int = 2):
         self.sample_rate = sample_rate
@@ -69,6 +75,22 @@ class TimestampGenerator:
             self._sequence += 1
             self._total_samples += frame_count
             return chunk
+
+    def reconcile(self, measured_pts: float, measured_wall_time: float):
+        """Reconcile PTS against an external wall clock measurement.
+
+        Adjusts base_pts to align the PTS timeline with the measured wall clock time.
+        This corrects for accumulated drift between the nominal sample rate and actual DAC rate.
+
+        Args:
+            measured_pts: The PTS value at the measurement point.
+            measured_wall_time: The wall clock time (monotonic) at the measurement point.
+        """
+        with self._lock:
+            if not self._initialized:
+                return
+            drift = measured_pts - measured_wall_time
+            self._base_pts -= drift
 
     def reset(self):
         with self._lock:
