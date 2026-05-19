@@ -1,9 +1,6 @@
 import os
-import re
-import time
 import json
-import signal
-import struct
+import time
 import logging
 import subprocess
 import threading
@@ -31,7 +28,9 @@ class AirPlaySession:
         self.channels = 2
         self.sample_width = 2
         self.rtp_timestamp: Optional[int] = None
+        self.rtp_clock_rate: int = 44100
         self.pts_offset: float = 0.0
+        self.session_bytes: int = 0
 
 
 class ShairportReceiver:
@@ -70,6 +69,7 @@ class ShairportReceiver:
         self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._meta_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
 
         self._state = ShairportState.IDLE
         self._state_lock = threading.Lock()
@@ -77,13 +77,14 @@ class ShairportReceiver:
 
         self._pcm_callback: Optional[Callable[[bytes, float], None]] = None
         self._state_callback: Optional[Callable[[str, dict], None]] = None
+        self._reconnect_callback: Optional[Callable[[], None]] = None
 
         self._meta_dir: Optional[Path] = None
         self._meta_file: Optional[Path] = None
         self._meta_fd: Optional[int] = None
 
-        self._total_bytes_received = 0
         self._connection_count = 0
+        self._total_bytes_received = 0
         self._last_error: Optional[str] = None
 
     @property
@@ -97,12 +98,14 @@ class ShairportReceiver:
             return self._session
 
     @property
-    def total_bytes_received(self) -> int:
-        return self._total_bytes_received
+    def connection_count(self) -> int:
+        with self._state_lock:
+            return self._connection_count
 
     @property
-    def connection_count(self) -> int:
-        return self._connection_count
+    def total_bytes_received(self) -> int:
+        with self._state_lock:
+            return self._total_bytes_received
 
     @property
     def last_error(self) -> Optional[str]:
@@ -116,14 +119,16 @@ class ShairportReceiver:
         """Set callback for state changes. Called with (state, context)."""
         self._state_callback = callback
 
+    def set_reconnect_callback(self, callback: Callable[[], None]):
+        """Set callback for reconnection events. Called when a new session starts."""
+        self._reconnect_callback = callback
+
     def start(self):
         """Start the shairport-sync receiver."""
         if self._running.is_set():
             return
 
         self._running.set()
-        self._total_bytes_received = 0
-        self._connection_count = 0
         self._last_error = None
 
         self._setup_metadata()
@@ -135,6 +140,9 @@ class ShairportReceiver:
         if self._meta_file:
             self._meta_thread = threading.Thread(target=self._metadata_loop, daemon=True)
             self._meta_thread.start()
+
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+        self._stderr_thread.start()
 
         self._set_state(ShairportState.IDLE)
 
@@ -159,12 +167,17 @@ class ShairportReceiver:
             self._meta_thread.join(timeout=2.0)
             self._meta_thread = None
 
+        if self._stderr_thread:
+            self._stderr_thread.join(timeout=2.0)
+            self._stderr_thread = None
+
         self._cleanup_metadata()
         self._set_state(ShairportState.IDLE)
 
     def _setup_metadata(self):
         """Create temporary directory for shairport-sync metadata."""
         import tempfile
+        import shutil
         self._meta_dir = Path(tempfile.mkdtemp(prefix="airsync_meta_"))
         self._meta_file = self._meta_dir / "metadata"
         self._meta_file.touch()
@@ -242,55 +255,119 @@ class ShairportReceiver:
                 else:
                     time.sleep(0.1)
 
+    def _stderr_loop(self):
+        """Read stderr from shairport-sync to prevent pipe buffer overflow."""
+        if self._process is None:
+            return
+        stderr = self._process.stderr
+
+        while self._running.is_set():
+            try:
+                line = stderr.readline()
+                if not line:
+                    if self._process.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                    continue
+                logger.debug("shairport-sync stderr: %s", line.decode(errors="replace").strip())
+            except (OSError, ValueError):
+                break
+
     def _on_pcm_data(self, data: bytes):
         """Handle incoming PCM data from shairport-sync."""
-        if self._state != ShairportState.PLAYING:
-            self._on_connection_start()
+        with self._state_lock:
+            if self._state != ShairportState.PLAYING:
+                self._on_connection_start_locked()
 
-        self._total_bytes_received += len(data)
+            self._total_bytes_received += len(data)
+            if self._session is not None:
+                self._session.session_bytes += len(data)
 
-        pts = self._compute_pts(len(data))
+            pts = self._compute_pts_locked(len(data))
 
         if self._pcm_callback:
             self._pcm_callback(data, pts)
 
     def _on_connection_start(self):
-        """Handle new AirPlay connection."""
+        """Handle new AirPlay connection (thread-safe wrapper)."""
+        with self._state_lock:
+            if self._state == ShairportState.PLAYING:
+                return
+            self._on_connection_start_locked()
+
+    def _on_connection_start_locked(self):
+        """Handle new AirPlay connection. Caller must hold _state_lock."""
         self._connection_count += 1
         self._session = AirPlaySession(client_name="unknown")
         self._session.pts_offset = time.monotonic()
-        self._set_state(ShairportState.PLAYING)
-        self._emit_state("connected", {"session": self._connection_count})
+        self._session.sample_rate = self.sample_rate
+        self._state = ShairportState.PLAYING
+
         logger.info("AirPlay connection #%d", self._connection_count)
+
+        callback = self._state_callback
+        reconnect_cb = self._reconnect_callback
+
+        if callback:
+            state = self._state
+            count = self._connection_count
+
+        if callback:
+            callback(state, {
+                "event": "connected",
+                "session": count,
+            })
+
+        if reconnect_cb:
+            reconnect_cb()
 
     def _on_connection_stop(self):
         """Handle AirPlay disconnection."""
-        self._session = None
-        self._set_state(ShairportState.IDLE)
-        self._emit_state("disconnected", {"session": self._connection_count})
+        with self._state_lock:
+            self._session = None
+            self._state = ShairportState.IDLE
+
+            callback = self._state_callback
+            count = self._connection_count
+
+        if callback:
+            callback(ShairportState.IDLE, {
+                "event": "disconnected",
+                "session": count,
+            })
+
         logger.info("AirPlay disconnected")
 
     def _compute_pts(self, data_length: int) -> float:
-        """Compute presentation timestamp for PCM data."""
+        """Compute presentation timestamp for PCM data (thread-safe)."""
+        with self._state_lock:
+            return self._compute_pts_locked(data_length)
+
+    def _compute_pts_locked(self, data_length: int) -> float:
+        """Compute presentation timestamp. Caller must hold _state_lock."""
         bytes_per_sample = self.channels * self.sample_width
         frames = data_length // bytes_per_sample
         duration = frames / self.sample_rate
 
-        with self._state_lock:
-            if self._session is None:
-                return time.monotonic()
-            base = self._session.pts_offset
+        if self._session is None:
+            return time.monotonic()
 
-        elapsed = self._total_bytes_received / (self.sample_rate * bytes_per_sample)
-        return base + elapsed - duration
+        if self._session.rtp_timestamp is not None:
+            rtp_elapsed = self._session.session_bytes / (self.sample_rate * bytes_per_sample)
+            return self._session.pts_offset + rtp_elapsed - duration
+
+        elapsed = self._session.session_bytes / (self.sample_rate * bytes_per_sample)
+        return self._session.pts_offset + elapsed - duration
 
     def _handle_process_exit(self):
         """Handle shairport-sync process exit."""
         returncode = self._process.returncode
         logger.info("shairport-sync exited with code %d", returncode)
 
-        if self._state == ShairportState.PLAYING:
-            self._on_connection_stop()
+        with self._state_lock:
+            if self._state == ShairportState.PLAYING:
+                self._session = None
+                self._state = ShairportState.IDLE
 
         self._last_error = f"Process exited with code {returncode}"
 
@@ -348,7 +425,7 @@ class ShairportReceiver:
             pass
 
     def _update_session_progress(self, meta: dict):
-        """Update session from progress metadata."""
+        """Update session from progress metadata and reconcile clock."""
         with self._state_lock:
             if self._session is None:
                 return
@@ -357,17 +434,23 @@ class ShairportReceiver:
             if rtp_timestamp is not None:
                 self._session.rtp_timestamp = rtp_timestamp
 
+            current_rtp = meta.get("current_timestamp")
+            output_timestamp = meta.get("output_timestamp")
+
+            if current_rtp is not None and output_timestamp is not None:
+                rtp_diff = current_rtp - self._session.rtp_timestamp if self._session.rtp_timestamp else 0
+                clock_rate = self._session.rtp_clock_rate
+                rtp_duration = rtp_diff / clock_rate
+
+                measured_wall = time.monotonic()
+                expected_wall = self._session.pts_offset + rtp_duration
+
+                drift = expected_wall - measured_wall
+                if abs(drift) > 0.001:
+                    self._session.pts_offset -= drift
+                    logger.debug("Clock reconciliation: drift=%.3fms", drift * 1000)
+
     def _set_state(self, state: str):
         """Update internal state."""
         with self._state_lock:
             self._state = state
-
-    def _emit_state(self, event: str, context: dict):
-        """Emit state change to callback."""
-        if self._state_callback:
-            with self._state_lock:
-                self._state_callback(self._state, {
-                    "event": event,
-                    "session": self._connection_count,
-                    **context,
-                })

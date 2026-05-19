@@ -17,6 +17,7 @@ class TestAirPlaySession(unittest.TestCase):
         self.assertEqual(session.channels, 2)
         self.assertEqual(session.sample_width, 2)
         self.assertIsNone(session.rtp_timestamp)
+        self.assertEqual(session.session_bytes, 0)
 
     def test_with_client_name(self):
         session = AirPlaySession(client_name="iPhone")
@@ -46,12 +47,15 @@ class TestShairportReceiver(unittest.TestCase):
         receiver = self._make_receiver()
         pcm_called = []
         state_called = []
+        reconnect_called = []
 
         receiver.set_pcm_callback(lambda data, pts: pcm_called.append((data, pts)))
         receiver.set_state_callback(lambda state, ctx: state_called.append((state, ctx)))
+        receiver.set_reconnect_callback(lambda: reconnect_called.append(True))
 
         self.assertIsNotNone(receiver._pcm_callback)
         self.assertIsNotNone(receiver._state_callback)
+        self.assertIsNotNone(receiver._reconnect_callback)
 
     def test_start_stop(self):
         receiver = self._make_receiver()
@@ -59,7 +63,8 @@ class TestShairportReceiver(unittest.TestCase):
         with patch.object(receiver, "_spawn_shairport"), \
              patch.object(receiver, "_setup_metadata"), \
              patch.object(receiver, "_cleanup_metadata"), \
-             patch.object(receiver, "_monitor_loop"):
+             patch.object(receiver, "_monitor_loop"), \
+             patch.object(receiver, "_stderr_loop"):
             receiver.start()
             self.assertTrue(receiver._running.is_set())
             receiver.stop()
@@ -71,7 +76,8 @@ class TestShairportReceiver(unittest.TestCase):
         with patch.object(receiver, "_spawn_shairport"), \
              patch.object(receiver, "_setup_metadata"), \
              patch.object(receiver, "_cleanup_metadata"), \
-             patch.object(receiver, "_monitor_loop"):
+             patch.object(receiver, "_monitor_loop"), \
+             patch.object(receiver, "_stderr_loop"):
             receiver.start()
             receiver.start()
             receiver.start()
@@ -82,7 +88,9 @@ class TestShairportReceiver(unittest.TestCase):
 
         with patch.object(receiver, "_spawn_shairport"), \
              patch.object(receiver, "_setup_metadata"), \
-             patch.object(receiver, "_cleanup_metadata"):
+             patch.object(receiver, "_cleanup_metadata"), \
+             patch.object(receiver, "_monitor_loop"), \
+             patch.object(receiver, "_stderr_loop"):
             receiver.stop()
             receiver.stop()
 
@@ -143,7 +151,7 @@ class TestShairportReceiver(unittest.TestCase):
         self.assertEqual(receiver.state, ShairportState.IDLE)
         self.assertIsNone(receiver.session)
 
-    def test_pts_computation(self):
+    def test_pts_computation_session_relative(self):
         receiver = self._make_receiver()
         receiver._on_connection_start()
 
@@ -171,6 +179,19 @@ class TestShairportReceiver(unittest.TestCase):
         receiver._on_connection_stop()
         receiver._on_connection_start()
         self.assertEqual(receiver.connection_count, 2)
+
+    def test_session_bytes_reset_on_reconnect(self):
+        receiver = self._make_receiver()
+        receiver._on_connection_start()
+        receiver._on_pcm_data(b"\x00" * 1000)
+        first_session_bytes = receiver.session.session_bytes
+
+        receiver._on_connection_stop()
+        receiver._on_connection_start()
+        second_session_bytes = receiver.session.session_bytes
+
+        self.assertGreater(first_session_bytes, 0)
+        self.assertEqual(second_session_bytes, 0)
 
     def test_metadata_parse_pbeg(self):
         receiver = self._make_receiver()
@@ -263,6 +284,23 @@ class TestShairportReceiver(unittest.TestCase):
         second_offset = receiver.session.pts_offset
 
         self.assertGreaterEqual(second_offset, first_offset)
+
+    def test_double_connection_start_prevented(self):
+        receiver = self._make_receiver()
+        receiver._on_connection_start()
+        receiver._on_connection_start()
+
+        self.assertEqual(receiver.connection_count, 1)
+        self.assertEqual(receiver.state, ShairportState.PLAYING)
+
+    def test_reconnect_callback_invoked(self):
+        receiver = self._make_receiver()
+        event = threading.Event()
+        receiver.set_reconnect_callback(lambda: event.set())
+
+        receiver._on_connection_start()
+
+        self.assertTrue(event.wait(timeout=1.0))
 
 
 if __name__ == "__main__":
